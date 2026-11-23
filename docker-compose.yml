@@ -7,6 +7,50 @@ services:
       - "${APP_PORT:-8000}:8000"
     environment:
       FURNACE_DB_PATH: /data/archive.db
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --workers
+      - "1"
+    volumes:
+      - archive-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+
+  # Optional second service process sharing the same SQLite volume.  Start it
+  # with:  docker compose --profile multi-process up --build
+  # Both processes coordinate through SQLite's write lock, so a run id still
+  # has exactly one "first archive" no matter which process receives it.
+  furnace-archive-2:
+    build: .
+    image: furnace-archive:latest
+    profiles: ["multi-process"]
+    environment:
+      FURNACE_DB_PATH: /data/archive.db
+    ports:
+      - "${APP_PORT_2:-8001}:8000"
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --workers
+      - "1"
     volumes:
       - archive-data:/data
     restart: unless-stopped

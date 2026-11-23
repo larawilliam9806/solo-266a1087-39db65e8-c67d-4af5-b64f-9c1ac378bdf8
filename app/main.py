@@ -29,6 +29,7 @@ import os
 from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -54,7 +55,10 @@ _QUERY_KEYS = {
 
 
 def _created(service: ArchiveService, result: ArchiveResult) -> JSONResponse:
-    archive = service.get(result.run_id)
+    # The archive and the over-temperature periods are both derived from the
+    # row this request wrote (``result.record``), never from a later read:
+    # another submission may already have replaced the row in the database.
+    archive = service.decorate(result.record)
     body = {
         "run_id": result.run_id,
         "archived": True,
@@ -163,19 +167,33 @@ def create_app(db_path: str | None = None) -> FastAPI:
     app.state.store = store
     app.state.service = service
 
-    def _store(payload: Any, path_run_id: str | None, request: Request) -> JSONResponse:
+    def _archive_sync(merged: Any, path_run_id: str | None) -> ArchiveResult:
+        run = parse_archive_request(merged, path_run_id)
+        return service.archive(run)
+
+    async def _store(
+        payload: Any, path_run_id: str | None, request: Request
+    ) -> JSONResponse:
         try:
             merged = _merge_query(payload, request)
-            run = parse_archive_request(merged, path_run_id)
-            result = service.archive(run)
+            # Compression is CPU-heavy and SQLite I/O is blocking, so run it
+            # off the event loop: while a long curve is being archived the
+            # single-process server still answers reads and short archives
+            # for other runs.
+            result = await run_in_threadpool(
+                _archive_sync, merged, path_run_id
+            )
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except ArchiveRejected as exc:
             return _cap_exceeded(exc)
         return _created(service, result)
 
-    def _get(run_id: str) -> dict[str, Any]:
-        record = service.get(run_id)
+    def _get_sync(run_id: str) -> dict[str, Any] | None:
+        return service.get(run_id)
+
+    async def _get(run_id: str) -> dict[str, Any]:
+        record = await run_in_threadpool(_get_sync, run_id)
         if record is None:
             raise HTTPException(status_code=404, detail="run not found")
         return record
@@ -194,7 +212,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def archive_run(
         request: Request, body: Any = Body(default=None)
     ) -> JSONResponse:
-        return _store(await _payload(request, body), None, request)
+        return await _store(await _payload(request, body), None, request)
 
     @app.put("/runs/{run_id}")
     @app.put("/archive/{run_id}")
@@ -203,7 +221,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def archive_run_at_path(
         run_id: str, request: Request, body: Any = Body(default=None)
     ) -> JSONResponse:
-        return _store(await _payload(request, body), run_id, request)
+        return await _store(await _payload(request, body), run_id, request)
 
     def custom_openapi() -> dict[str, Any]:
         if app.openapi_schema:
@@ -240,8 +258,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/archive/{run_id}")
     @app.get("/archives/{run_id}")
     @app.get("/api/runs/{run_id}")
-    def get_run(run_id: str) -> dict[str, Any]:
-        return _get(run_id)
+    async def get_run(run_id: str) -> dict[str, Any]:
+        return await _get(run_id)
 
     return app
 

@@ -24,6 +24,10 @@ class ArchiveResult:
     source_point_count: int
     required_points: int
     replaced: bool
+    # Exactly the row this request wrote, captured inside the write
+    # transaction.  Responses are built from it rather than from a later
+    # read, so a concurrent replacement cannot bleed into this receipt.
+    record: dict[str, Any]
 
 
 class ArchiveRejected(Exception):
@@ -65,10 +69,12 @@ class ArchiveService:
 
         required_points = sum(len(seg) for seg in archived)
         if required_points > run.max_points:
+            # Rejected before touching the database: the previous archive,
+            # which may have been committed by another process a moment ago,
+            # stays as it is.
             raise ArchiveRejected(run.run_id, required_points, run.max_points)
 
-        replaced = self.store.get(run.run_id) is not None
-        self.store.put(
+        stored = self.store.put(
             run_id=run.run_id,
             segments=[
                 [_point_json(t, v) for (t, v) in segment] for segment in archived
@@ -84,7 +90,8 @@ class ArchiveService:
             segments=archived,
             source_point_count=run.point_count,
             required_points=required_points,
-            replaced=replaced,
+            replaced=stored["replaced"],
+            record=stored,
         )
 
     # -- read ----------------------------------------------------------
@@ -93,7 +100,7 @@ class ArchiveService:
         record = self.store.get(run_id)
         if record is None:
             return None
-        return self._decorate(record)
+        return self.decorate(record)
 
     def list(self) -> list[dict[str, Any]]:
         return [
@@ -112,7 +119,8 @@ class ArchiveService:
         ]
 
     @staticmethod
-    def _decorate(record: dict[str, Any]) -> dict[str, Any]:
+    def decorate(record: dict[str, Any]) -> dict[str, Any]:
+        """Turn a stored (or just-written) row into the public archive view."""
         limit = Fraction(record["limit"])
         tolerance = Fraction(record["tolerance"])
 
